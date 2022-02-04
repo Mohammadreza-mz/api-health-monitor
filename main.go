@@ -1,19 +1,25 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/bcrypt"
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 )
 
-func sendAlert(username string, url string) {
-	// TODO: insert an alert for given username and url in database
 
-	list := users[username].Urls
+func sendAlert(username string, url string) {
+	res, _ := GetUserByUsername(username)
+	list := res.Urls
 	var index int
 	for ind, x := range list {
 		if x.Endpoint == url {
@@ -21,16 +27,12 @@ func sendAlert(username string, url string) {
 		}
 	}
 
-	curUser := users[username]
-	curUser.AlertedURLs = append(curUser.AlertedURLs, users[username].Urls[index].Endpoint)
-	users[username] = curUser
+	UpdateDBByUser(username, "alerted_urls", append(res.AlertedURLs, res.Urls[index].Endpoint))
 }
 func updateDB(username string, url string, statusCode int) {
-	// TODO: update successCount or failureCount in database
-	// TODO: call sendAlert function if we have reached to the limit
-
 	success := statusCode/100 == 2
-	list := users[username].Urls
+	res, _ := GetUserByUsername(username)
+	list := res.Urls
 
 	var index int
 	for ind, x := range list {
@@ -39,10 +41,12 @@ func updateDB(username string, url string, statusCode int) {
 		}
 	}
 	if success {
-		users[username].Urls[index].SuccessCount++
+		res.Urls[index].SuccessCount++
+		UpdateDBByUser(username, "urls", res.Urls)
 	} else {
-		users[username].Urls[index].FailureCount++
-		if users[username].Urls[index].FailureCount == users[username].Urls[index].FailLimit {
+		res.Urls[index].FailureCount++
+		UpdateDBByUser(username, "urls", res.Urls)
+		if res.Urls[index].FailureCount == res.Urls[index].FailLimit {
 			sendAlert(username, url)
 		}
 	}
@@ -69,23 +73,32 @@ func doEveryDSecond(d int, url string, username string) {
 func resetAtEndOfTheDay() {
 	for {
 		time.Sleep(24 * time.Hour)
-		// TODO: reset successCount and failureCount and alerts in database
+		res, _ := GetAllUsers()
+		for _,x := range res{
+			x.AlertedURLs = []string{}
+			for _,u:= range x.Urls{
+				u.FailureCount =0
+				u.SuccessCount =0
+			}
+			UpdateDBByUser(x.Username, "urls", x.Urls)
+			UpdateDBByUser(x.Username, "alerted_urls", x.AlertedURLs)
+		}
 	}
 }
 
 type URL struct {
-	Endpoint      string `json:"endpoint"`
-	RequestPeriod int    `json:"request_period"`
-	FailLimit     int    `json:"fail_limit"`
-	SuccessCount  int    `json:"success_count"`
-	FailureCount  int    `json:"failure_count"`
+	Endpoint      string `json:"endpoint" bson:"endpoint"`
+	RequestPeriod int    `json:"request_period" bson:"request_period"`
+	FailLimit     int    `json:"fail_limit" bson:"fail_limit"`
+	SuccessCount  int    `json:"success_count" bson:"success_count"`
+	FailureCount  int    `json:"failure_count" bson:"failure_count"`
 }
 
 type User struct {
-	Username     string   `json:"username"`
-	PasswordHash string   `json:"password_hash"`
-	Urls         []URL    `json:"urls"`
-	AlertedURLs  []string `json:"alerted_urls"`
+	Username     string   `json:"username" bson:"username"`
+	PasswordHash string   `json:"password_hash" bson:"password_hash"`
+	Urls         []URL    `json:"urls" bson:"urls"`
+	AlertedURLs  []string `json:"alerted_urls" bson:"alerted_urls"`
 }
 
 func createUser(w http.ResponseWriter, r *http.Request) {
@@ -96,19 +109,17 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 	username := r.Header.Get("username")
 	password := r.Header.Get("password")
 	hashed, _ := bcrypt.GenerateFromPassword([]byte(password), 8)
-	if _, ok := users[username]; ok {
+	if x,_ := GetUserByUsername(username); x.Username != "" {
 		http.Error(w, "username is already taken", http.StatusForbidden)
 	} else {
-		users[username] = User{Username: username, PasswordHash: string(hashed), Urls: []URL{}, AlertedURLs: []string{}}
-		// TODO: create user in database
+		CreateUserInDB(User{Username: username, PasswordHash: string(hashed), Urls: []URL{}, AlertedURLs: []string{}})
 		fmt.Fprintf(w, "register successfully")
 	}
 }
 
 func checkPassword(username string, password string) bool {
-	// TODO: read password hash from database
-	res, ok := users[username]
-	if !ok {
+	res, _ := GetUserByUsername(username)
+	if res.Username == ""{
 		return false
 	}
 	err := bcrypt.CompareHashAndPassword([]byte(res.PasswordHash), []byte(password))
@@ -125,8 +136,8 @@ func askEndpoints(w http.ResponseWriter, r *http.Request) {
 	if !checkPassword(username, password) {
 		http.Error(w, "username or password is incorrect", http.StatusForbidden)
 	} else {
-		// TODO: read from database
-		list, err := json.Marshal(users[username].Urls)
+		res, _ := GetUserByUsername(username)
+		list, err := json.Marshal(res.Urls)
 		if err != nil {
 			fmt.Fprintf(w, "cannot convert data to JSON")
 		} else {
@@ -146,8 +157,8 @@ func askEndpoint(w http.ResponseWriter, r *http.Request) {
 	if !checkPassword(username, password) {
 		http.Error(w, "username or password is incorrect", http.StatusForbidden)
 	} else {
-		// TODO: read from database
-		list := users[username].Urls
+		res, _ := GetUserByUsername(username)
+		list := res.Urls
 		for _, x := range list {
 			if x.Endpoint == askedUrl {
 				ans, err := json.Marshal(x)
@@ -174,7 +185,8 @@ func addEndpoint(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "username or password is incorrect", http.StatusForbidden)
 		return
 	}
-	if len(users[username].Urls) == 20 {
+	res, _ := GetUserByUsername(username)
+	if len(res.Urls) == 20 {
 		http.Error(w, "you have reached to the 20 urls limit", http.StatusForbidden)
 		return
 	}
@@ -196,6 +208,7 @@ func addEndpoint(w http.ResponseWriter, r *http.Request) {
 
 	if ok1 != nil || ok2 != nil {
 		http.Error(w, "fail_limit and request_period are required and must be integers", http.StatusForbidden)
+		return
 	}
 
 	if requestPeriod < 1 {
@@ -203,19 +216,14 @@ func addEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	queryUrl := URL{Endpoint: endpoint, FailLimit: failLimit, FailureCount: 0, SuccessCount: 0, RequestPeriod: requestPeriod}
-	// TODO: read from database
-	list := users[username].Urls
+	list := res.Urls
 	for _, x := range list {
 		if x.Endpoint == endpoint {
 			http.Error(w, "url is already in tracking list", http.StatusForbidden)
 			return
 		}
 	}
-	// TODO: insert to database
-	curUser := users[username]
-	curUser.Urls = append(curUser.Urls, queryUrl)
-	users[username] = curUser
-
+	UpdateDBByUser(username, "urls", append(res.Urls, queryUrl))
 	go doEveryDSecond(requestPeriod, endpoint, username)
 }
 
@@ -230,8 +238,9 @@ func alerts(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "username or password is incorrect", http.StatusForbidden)
 		return
 	}
-	// TODO: read from database
-	list, err := json.Marshal(users[username].AlertedURLs)
+
+	res, _ := GetUserByUsername(username)
+	list, err := json.Marshal(res.AlertedURLs)
 	if err != nil {
 		fmt.Fprintf(w, "cannot convert data to JSON")
 	} else {
@@ -239,7 +248,14 @@ func alerts(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var users = map[string]User{}
+func PrepareAPI() {
+	res, _ := GetAllUsers()
+	for _,x:= range res{
+		for _,req:= range x.Urls{
+			go doEveryDSecond(req.RequestPeriod, req.Endpoint, x.Username)
+		}
+	}
+}
 
 func main() {
 	//doEveryDSecond(1, "http://google.com/", "ali")
@@ -250,6 +266,148 @@ func main() {
 	http.HandleFunc("/url", askEndpoint)
 	http.HandleFunc("/addurl", addEndpoint)
 	http.HandleFunc("/alerts", alerts)
+
+	PrepareAPI()
 	go resetAtEndOfTheDay()
-	log.Fatal(http.ListenAndServe(":8401", nil))
+	log.Fatal(http.ListenAndServe(":8405", nil))
+}
+
+
+
+
+
+
+
+
+/* Used to create a singleton object of MongoDB client.
+Initialized and exposed through  GetMongoClient().*/
+var clientInstance *mongo.Client
+//Used during creation of singleton client object in GetMongoClient().
+var clientInstanceError error
+//Used to execute client creation procedure only once.
+var mongoOnce sync.Once
+//I have used below constants just to hold required database config's.
+const (
+	CONNECTIONSTRING = "mongodb://localhost:27017"
+	DB               = "db_issue_manager"
+	ISSUES           = "col_issues"
+)
+
+//GetMongoClient - Return mongodb connection to work with
+func GetMongoClient() (*mongo.Client, error) {
+	//Perform connection creation operation only once.
+	mongoOnce.Do(func() {
+		// Set client options
+		clientOptions := options.Client().ApplyURI(CONNECTIONSTRING)
+		// Connect to MongoDB
+		client, err := mongo.Connect(context.TODO(), clientOptions)
+		if err != nil {
+			clientInstanceError = err
+		}
+		// Check the connection
+		err = client.Ping(context.TODO(), nil)
+		if err != nil {
+			clientInstanceError = err
+		}
+		clientInstance = client
+	})
+	return clientInstance, clientInstanceError
+}
+
+//CreateUserInDB - Insert a new document in the collection.
+func CreateUserInDB(task User) error {
+	//Get MongoDB connection using connectionhelper.
+	client, err := GetMongoClient()
+	if err != nil {
+		return err
+	}
+	//Create a handle to the respective collection in the database.
+	collection := client.Database(DB).Collection(ISSUES)
+	//Perform InsertOne operation & validate against the error.
+	_, err = collection.InsertOne(context.TODO(), task)
+	if err != nil {
+		return err
+	}
+	//Return success without any error.
+	return nil
+}
+
+//GetUserByUsername - Get All Users for collection
+func GetUserByUsername(username string) (User, error) {
+	result := User{}
+	//Define filter query for fetching specific document from collection
+	filter := bson.D{primitive.E{Key: "username", Value: username}}
+	//Get MongoDB connection using connectionhelper.
+	client, err := GetMongoClient()
+	if err != nil {
+		return result, err
+	}
+	//Create a handle to the respective collection in the database.
+	collection := client.Database(DB).Collection(ISSUES)
+	//Perform FindOne operation & validate against the error.
+	err = collection.FindOne(context.TODO(), filter).Decode(&result)
+	if err != nil {
+		return result, err
+	}
+	//Return result without any error.
+	return result, nil
+}
+
+//GetAllUsers - Get All Users for collection
+func GetAllUsers() ([]User, error) {
+	//Define filter query for fetching specific document from collection
+	filter := bson.D{{}} //bson.D{{}} specifies 'all documents'
+	issues := []User{}
+	//Get MongoDB connection using connectionhelper.
+	client, err := GetMongoClient()
+	if err != nil {
+		return issues, err
+	}
+	//Create a handle to the respective collection in the database.
+	collection := client.Database(DB).Collection(ISSUES)
+	//Perform Find operation & validate against the error.
+	cur, findError := collection.Find(context.TODO(), filter)
+	if findError != nil {
+		return issues, findError
+	}
+	//Map result to slice
+	for cur.Next(context.TODO()) {
+		t := User{}
+		err := cur.Decode(&t)
+		if err != nil {
+			return issues, err
+		}
+		issues = append(issues, t)
+	}
+	// once exhausted, close the cursor
+	cur.Close(context.TODO())
+	if len(issues) == 0 {
+		return issues, mongo.ErrNoDocuments
+	}
+	return issues, nil
+}
+
+func UpdateDBByUser(username string, field string, updated interface{}) error {
+	//Define filter query for fetching specific document from collection
+	filter := bson.D{primitive.E{Key: "username", Value: username}}
+
+	//Define updater for to specifiy change to be updated.
+	updater := bson.D{primitive.E{Key: "$set", Value: bson.D{
+		primitive.E{Key: field, Value: updated},
+	}}}
+
+	//Get MongoDB connection using connectionhelper.
+	client, err := GetMongoClient()
+	if err != nil {
+		return err
+	}
+	collection := client.Database(DB).Collection(ISSUES)
+
+	//Perform UpdateOne operation & validate against the error.
+	_, err = collection.UpdateOne(context.TODO(), filter, updater)
+	if err != nil {
+		return err
+	}
+	//Return success without any error.
+	return nil
 }
